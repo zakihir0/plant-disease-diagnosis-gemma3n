@@ -1,58 +1,55 @@
 # Plant Disease Diagnosis with Gemma3n
 
-A comprehensive plant disease diagnosis system using Gemma3n vision model with CNN classifiers and RAG (Retrieval-Augmented Generation) for knowledge retrieval.
+A comprehensive plant disease diagnosis system using Gemma3n vision model with CNN classifier and RAG (Retrieval-Augmented Generation) for expert knowledge retrieval.
 
-## Features
+## 🌟 Features
 
 - **Vision-based Plant Disease Classification**: Uses Gemma3n vision model for accurate plant disease identification
-- **CNN Model Training**: Multiple classifier architectures including Linear, MLP, and TinyCNN with LoRA fine-tuning
-- **RAG System**: Retrieval-Augmented Generation for comprehensive disease information and management recommendations
-- **Query Generation**: Intelligent search query generation from natural language and image inputs
-- **Expert Knowledge Base**: Built-in database with detailed information about various plant diseases
+- **Efficient CNN Architecture**: VisionTinyCNN with depth-wise convolutions for optimized processing
+- **RAG System**: Retrieval-Augmented Generation with FAISS vector search for comprehensive disease information
+- **Intelligent Query Generation**: LLM-powered search query generation from natural language and image inputs
+- **Expert Knowledge Base**: Built-in database with detailed information about 9 major plant diseases
+- **Interactive Testing**: Comprehensive testing framework with multiple disease scenarios
+- **Mixed Precision Training**: Automatic precision selection (BF16/FP16) for optimal performance
+- **Comprehensive Jupyter Notebook**: 15-section technical guide for data scientists
 
-## Architecture
+## 🏗️ Architecture
 
-### Vision Models
-- **VisionLinearClassifier**: Simple linear classifier on top of frozen vision features
-- **VisionMLPClassifier**: Multi-layer perceptron with dropout for better generalization
-- **VisionTinyCNN**: Lightweight CNN with depth-wise convolutions for efficient processing
+### Vision Model
+- **VisionTinyCNN**: Lightweight CNN with depth-wise convolutions and frozen vision tower
+  - Dimension reduction: 2048 → 256 channels
+  - Efficient processing with adaptive pooling
+  - Parameter efficiency: Only classification head is trainable
 
 ### RAG Pipeline
-1. **Image Analysis**: CNN model predicts plant disease with confidence scores
-2. **Query Generation**: Converts user questions and predictions into search queries
-3. **Knowledge Retrieval**: FAISS-based semantic search through disease database
-4. **Response Generation**: Comprehensive answers using retrieved knowledge and vision predictions
+1. **Image Analysis**: VisionTinyCNN predicts plant disease with Top-3 confidence scores
+2. **Query Generation**: LLM converts user questions + predictions into structured search queries
+3. **Knowledge Retrieval**: FAISS HNSW semantic search through expert disease database
+4. **Response Generation**: Comprehensive answers combining vision predictions and retrieved knowledge
 
-## Requirements
+### Testing Features
+- **Multi-Disease Testing**: Automated testing with Apple scab, Potato early blight, and Corn northern leaf blight
+- **Complete Response Display**: Full expert recommendations with symptoms and management strategies
+- **Accuracy Validation**: Comparison between predicted and expected disease classifications
+
+## 📋 Requirements
 
 ### Core Dependencies
 - Python 3.8+
 - PyTorch 2.0+
-- CUDA-compatible GPU (recommended)
+- CUDA-compatible GPU (recommended for training)
 
-### ML/AI Libraries
-- `unsloth>=2025.8.1` - Efficient model training and inference
-- `transformers>=4.53.3` - Hugging Face transformers
-- `torch` - PyTorch framework
-- `torchvision` - Computer vision utilities
-- `peft` - Parameter-efficient fine-tuning
-- `trl` - Transformer reinforcement learning
-
-### Vision & Processing
+### Key Libraries
+- `unsloth==2025.8.1` - Efficient model training and inference
+- `transformers==4.53.3` - Hugging Face transformers
+- `faiss-cpu` - FAISS vector similarity search
+- `sentence-transformers` - Text embeddings for RAG
 - `Pillow` - Image processing
-- `timm` - Image models
-- `datasets` - Dataset utilities
-
-### RAG & Search
-- `faiss-cpu` - Similarity search
-- `sentence-transformers` - Text embeddings
-- `numpy` - Numerical computations
-
-### Training & Evaluation
-- `accelerate` - Distributed training
+- `matplotlib` - Visualization and image display
 - `scikit-learn` - Metrics and evaluation
-- `pandas` - Data manipulation
-- `tqdm` - Progress bars
+
+### Complete Dependencies
+See `requirements.txt` for the full list of dependencies with specific versions.
 
 ## Installation
 
@@ -72,16 +69,32 @@ pip install -r requirements.txt
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
 
-## Usage
+## 🚀 Usage
 
-### Basic Usage
+### Quick Start
 
-1. **Load the model and setup**:
+1. **Run the complete system**:
+```python
+# Execute workflow_2.py for full training and demo
+python workflow_2.py
+```
+
+2. **Or use Jupyter Notebook**:
+```bash
+jupyter notebook plant_disease_diagnosis_notebook.ipynb
+```
+
+### API Usage
+
+1. **Load trained model**:
 ```python
 from unsloth import FastVisionModel
 from transformers import AutoProcessor
 
-# Load Gemma3n vision model
+# Load Gemma3n vision model with mixed precision
+def get_amp_dtype():
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
 model, tokenizer = FastVisionModel.from_pretrained(
     model_name="unsloth/gemma-3n-E2B-it",
     dtype=None,
@@ -89,33 +102,27 @@ model, tokenizer = FastVisionModel.from_pretrained(
     load_in_4bit=True,
     full_finetuning=False,
 )
-
-processor = AutoProcessor.from_pretrained(
-    "unsloth/gemma-3n-E2B-it",
-    trust_remote_code=True
-)
 ```
 
-2. **Train a classifier**:
+2. **Train VisionTinyCNN classifier**:
 ```python
-# Create and train vision classifier
+# Create efficient CNN classifier
 vision_tower = model.model.vision_tower
 vis_model = VisionTinyCNN(vision_tower, num_classes=len(class_names))
 
-trainer = CNNTrainer(
-    model=vis_model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    data_collator=VisionDataCollator(processor),
+# Training with FP16 precision
+args = TrainingArguments(
+    per_device_train_batch_size=8,
+    gradient_accumulation_steps=8,
+    fp16=True,  # Mixed precision training
+    max_steps=100,
+    learning_rate=1e-3,
 )
-
-trainer.train()
 ```
 
-3. **Use RAG for diagnosis**:
+3. **Generate comprehensive diagnosis**:
 ```python
-# Generate comprehensive diagnosis
+# Full RAG pipeline
 result = generate_rag_response(
     user_question="What is this plant disease?",
     image_path="path/to/plant_image.jpg",
@@ -124,7 +131,9 @@ result = generate_rag_response(
     class_names_list=class_names
 )
 
+# Get comprehensive expert response
 print(f"Diagnosis: {result['final_response']}")
+print(f"Vision Predictions: {result['vision_predictions']}")
 ```
 
 ### Supported Plant Diseases
