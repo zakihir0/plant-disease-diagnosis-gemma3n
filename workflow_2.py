@@ -51,6 +51,8 @@ def get_amp_dtype() -> torch.dtype:
 
 amp_dtype = get_amp_dtype()
 
+base_dir = '/notebooks/kaggle/input/new_plant_diseases/2/New Plant Diseases Dataset(Augmented)/New Plant Diseases Dataset(Augmented)'
+
 # load model and tokenizer (using default precision)
 print("🔧 Loading model with default precision (no quantization)...")
 llm_model, tokenizer = FastVisionModel.from_pretrained(
@@ -64,7 +66,6 @@ print("✅ Model loaded with default precision")
 
 #%%
 # Data loading using existing train/valid split
-base_dir = '/notebooks/kaggle/input/new_plant_diseases/2/New Plant Diseases Dataset(Augmented)/New Plant Diseases Dataset(Augmented)'
 train_dir = os.path.join(base_dir, 'train')
 valid_dir = os.path.join(base_dir, 'valid')
 
@@ -137,39 +138,6 @@ print(f"Image type: {type(train_ds[0]['image'])}")
 print(f"Label: {train_ds[0]['labels']} (class: {class_names[train_ds[0]['labels']]})")
 
 #%%
-class VisionLinearClassifier(nn.Module):
-    def __init__(self, vision_model, num_classes):
-        super().__init__()
-        self.vision_model = vision_model
-        self.pool = nn.AdaptiveAvgPool2d(1)     # (B,C,H,W) → (B,C,1,1)
-        hidden = vision_model.config.hidden_size
-        self.classifier = nn.Linear(hidden, num_classes)
-
-    def forward(self, pixel_values, **kwargs):
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            feats = self.vision_model(pixel_values.to(torch.bfloat16)).last_hidden_state  # (B,C,H,W)
-        feats = self.pool(feats).flatten(1)      # (B,C)
-        logits = self.classifier(feats)          # (B,num_classes)
-        return logits
-
-class VisionMLPClassifier(nn.Module):
-    def __init__(self, vision_model, num_classes, hidden=2048, mlp_dim=512):
-        super().__init__()
-        self.vision_model = vision_model
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.mlp_head = nn.Sequential(
-            nn.Linear(hidden, mlp_dim),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(mlp_dim, num_classes)
-        )
-
-    def forward(self, pixel_values):
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            feats = self.vision_model(pixel_values.to(torch.bfloat16)).last_hidden_state
-        feats = self.pool(feats).flatten(1)              # (B,C)
-        return self.mlp_head(feats)
-
 class VisionTinyCNN(nn.Module):
     def __init__(self, vision_model, num_classes, hidden=2048):
         super().__init__()
@@ -186,8 +154,8 @@ class VisionTinyCNN(nn.Module):
         self.fc    = nn.Linear(256, num_classes)
 
     def forward(self, pixel_values):
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            x = self.vision_model(pixel_values.to(torch.bfloat16)).last_hidden_state
+        with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
+            x = self.vision_model(pixel_values.to(amp_dtype)).last_hidden_state
         x = self.conv_head(x)                # (B,256,H,W)
         x = self.pool(x).flatten(1)          # (B,256)
         return self.fc(x)
@@ -304,13 +272,6 @@ from peft import LoraConfig, get_peft_model, TaskType
 vision_tower = llm_model.model.vision_tower
 vision_tower.eval(); vision_tower.requires_grad_(False)
 
-lora_cfg = LoraConfig(
-    task_type=TaskType.FEATURE_EXTRACTION,
-    r=8, lora_alpha=16, lora_dropout=0.05,
-    target_modules=["qkv", "proj"],   # ViT-based modules
-)
-lora_tower = get_peft_model(vision_tower, lora_cfg)
-
 vis_model = VisionTinyCNN(vision_tower, num_classes=len(class_names)).to("cuda")
 
 # Training arguments
@@ -323,8 +284,8 @@ args = TrainingArguments(
     num_train_epochs=1,
     learning_rate=1e-3,  
     lr_scheduler_type='linear',
-    bf16=True, 
-    fp16=False,
+    bf16=False, 
+    fp16=True,
     remove_unused_columns=False,
     max_steps=100,
     eval_strategy="steps",
@@ -353,21 +314,15 @@ trainer.train()
 
 #%%
 # ========================================
-# CNN Model Inference for Query Generation
+# Plant Disease Prediction and Response Generation
 # ========================================
 
+import json
+import re
+from typing import Any, Dict, List
+
 def predict_plant_disease(image, vision_model, processor, class_names_list=None):
-    """Predict plant disease with CNN model and return class names with probabilities
-    
-    Args:
-        image: PIL Image
-        vision_model: Trained Vision model
-        processor: Gemma3n processor (AutoProcessor)
-        class_names_list: List of class names
-    
-    Returns:
-        list: [{'class_name': str, 'confidence': float}, ...] (Top-3)
-    """
+    """Predict plant disease with CNN model and return class names with probabilities"""
     # Convert image to RGB (if needed)
     if image.mode != 'RGB':
         image = image.convert('RGB')
@@ -390,16 +345,31 @@ def predict_plant_disease(image, vision_model, processor, class_names_list=None)
     
     return predictions
 
-print("🔮 CNN inference function ready for Query Generation!")
-
-#%%
-# ========================================
-# Query Generation Functions
-# ========================================
-
-import json
-import re
-from typing import Any, Dict, List
+def generate_response(messages, max_new_tokens=128, temperature=0.7, top_p=0.9):
+    """Common function for generating responses from model"""
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to("cuda")
+    
+    generation_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "do_sample": True,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+    
+    with torch.no_grad():
+        outputs = llm_model.generate(**inputs, **generation_kwargs)
+    
+    response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+    response = tokenizer.decode(response_tokens, skip_special_tokens=True)
+    
+    return response
 
 QUERY_GENERATION_PROMPT = """
 # System
@@ -432,51 +402,12 @@ Correct output: {{"query":["weather today","current weather"],"is_plant":"no"}}
 
 """
 
-def generate_response(messages, max_new_tokens=128, temperature=0.7, top_p=0.9, use_no_grad=False):
-    """Common function for generating responses from model"""
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    ).to("cuda")
-    
-    generation_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "do_sample": True,
-        "pad_token_id": tokenizer.eos_token_id,
-    }
-    
-    if use_no_grad:
-        with torch.no_grad():
-            outputs = llm_model.generate(**inputs, **generation_kwargs)
-    else:
-        outputs = llm_model.generate(**inputs, **generation_kwargs)
-    
-    response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-    response = tokenizer.decode(response_tokens, skip_special_tokens=True)
-    
-    return response
-
-def generate_search_query(text, image_path, vision_model=None, processor=None, class_names_list=None):
+def generate_search_query(text, image, vision_predictions):
     """Generate search query from user natural language input with CNN prediction integration"""
-
-    image = Image.open(image_path)
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-
-    # Analyze image with Vision model (if available)
-    image_predictions = []
-    if vision_model is not None and processor is not None:
-        image_predictions = predict_plant_disease(image, vision_model, processor, class_names_list)
-        print(f"🔍 CNN Prediction: {image_predictions}")
-
+    
     # Embed CNN prediction results into prompt
     prompt_with_predictions = QUERY_GENERATION_PROMPT.format(
-        image_predictions=image_predictions if image_predictions else "No analysis results"
+        image_predictions=vision_predictions if vision_predictions else "No analysis results"
     )
 
     messages = [
@@ -519,60 +450,20 @@ def safe_json_loads(raw: str) -> Dict[str, Any]:
 
     return data
 
-test1 = "What are the symptoms?"
-test2 = "/notebooks/plant_images/apple_apple_scab/image_0.jpg"
-
-# Generate query using Vision model (after training)
-parsed_query = generate_search_query(
-    text=test1, 
-    image_path=test2, 
-    vision_model=vis_model,  # Pass trained Vision model
-    processor=processor,  # Gemma3n processor
-    class_names_list=class_names
-)
-print(f"🔍 Generated Query with CNN predictions: {parsed_query}")
 # %%
-# RAG
+# ========================================
+# RAG Knowledge Base and Search
+# ========================================
+
 import os, glob, json, faiss, numpy as np
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 
-DATA_DIR      = "docs"          # Folder to load from
-CHUNK_SIZE    = 512              # Approximate character count equivalent to tokens
+# RAG configuration
+CHUNK_SIZE = 512
 CHUNK_OVERLAP = 64
-INDEX_FILE    = "faiss.index"
-META_FILE     = "plant_disease_rag_knowledge_base.json"
 
-def load_and_chunk_doc(path:str):
-    """Load file and split by CHUNK_SIZE"""
-    chunks = []
-    metas = []
-    
-    # For JSON files, load existing knowledge base
-    if path.endswith('.json'):
-        with open(path, 'r', encoding='utf-8') as f:
-            knowledge_base = json.load(f)
-        
-        for entry in knowledge_base:
-            # Split context of each entry
-            context = entry['context']
-            class_name = entry['class_name']
-            
-            # Split text by CHUNK_SIZE
-            for i in range(0, len(context), CHUNK_SIZE - CHUNK_OVERLAP):
-                chunk_text = context[i:i + CHUNK_SIZE]
-                if len(chunk_text.strip()) > 50:  # Exclude chunks that are too short
-                    chunks.append(chunk_text)
-                    metas.append({
-                        "source": f"{class_name}",
-                        "text": chunk_text,
-                        "class_name": class_name,
-                        "id": entry['id']
-                    })
-    
-    return chunks, metas
-
-#%%
+# Knowledge base - define first
 RAG_DATABASE = [
   {
     "id": "apple_scab_001",
@@ -625,14 +516,6 @@ RAG_DATABASE = [
     "context": "Esca, also known as Black Measles, is a destructive grapevine trunk disease caused by a complex of wood-infecting fungi, primarily *Phaeomoniella chlamydospora* and species of *Phaeoacremonium*. The fungi infect vines through pruning wounds.\n\n### Symptoms\n\nEsca symptoms can be chronic or acute (apoplexy) and affect leaves, fruit, and the woody trunk.\n\n*   **Leaf Symptoms (Chronic):** A characteristic symptom is interveinal 'striping'. In red grape varieties, the stripes are dark red, while in white varieties, they are yellow or chlorotic. These stripes can dry out, and leaves may develop a 'tiger-stripe' pattern. Severely affected leaves may drop prematurely.\n*   **Fruit Symptoms (Chronic):** Berries can develop small, round, dark spots, often bordered by a brown-purple ring, giving them a 'measles' appearance. Affected berries may crack or fail to ripen properly.\n*   **Wood Symptoms:** A cross-section of an infected trunk or cordon reveals dark brown to black streaking or a pattern of dark spots in the vascular tissue (xylem). This is a sign of the internal wood decay.\n*   **Apoplexy (Acute):** This is a sudden collapse of the vine. A part of the vine or the entire plant may rapidly wilt and die, especially during hot summer weather.\n\n### Management\n\nManagement focuses on prevention as there is no cure once a vine is infected.\n\n*   **Pruning Practices:**\n    *   **Wound Protection:** This is the most critical step. Protect large pruning wounds with a wound sealant or paint containing a fungicide (e.g., thiophanate-methyl) to prevent fungal entry.\n    *   **Timing:** Avoid pruning during wet, rainy weather when fungal spores are most active. Delayed pruning (late winter/early spring) can be beneficial.\n*   **Sanitation:**\n    *   **Remove Infected Wood:** Surgically remove and destroy cankered or dead parts of the vine. When removing a diseased trunk, cut well below the visible symptoms of infection.\n*   **Cultural Practices:**\n    *   **Vine Health:** Maintain good vine vigor with proper irrigation and nutrition to help them resist or recover from infection.\n    *   **New Vineyards:** In new plantings, use clean nursery stock and establish a strong vine structure before allowing it to fruit."
   }
 ]
-#%%
-# RAG configuration
-CHUNK_SIZE = 512
-CHUNK_OVERLAP = 64
-
-# Load knowledge base and chunk it
-docs = []
-metas = []
 
 def load_and_chunk_rag_database():
     """Load data from RAG_DATABASE and chunk it"""
@@ -672,13 +555,12 @@ def load_and_chunk_rag_database():
     
     return chunks, chunk_metas
 
-docs, metas = [], []
+# Initialize and load knowledge base
 print("📄 Loading & chunking from RAG_DATABASE …")
 chunks, chunk_metas = load_and_chunk_rag_database()
-docs.extend(chunks)
-metas.extend(chunk_metas)
+docs = chunks
+metas = chunk_metas
 
-#%%
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device="cuda" if torch.cuda.is_available() else "cpu")
 embs  = embedding_model.encode(docs, batch_size=64, show_progress_bar=True, normalize_embeddings=True)
 embs  = np.asarray(embs).astype("float32")   # faiss uses float32
@@ -708,18 +590,10 @@ def search(query, k:int=5):
         })
     return hits
 
-# Execute RAG search
-print("🔍 RAG Search Results:")
-search_results = search(parsed_query)
-for h in search_results:
-    print(f"[{h['rank']}] Score: {h['score']:.4f} | {h['source']}")
-    print(f"Text: {h['text']}")
-    print("-" * 80)
-
 def generate_rag_response(user_question, image_path, vision_model, processor, class_names_list):
     """Comprehensive response generation combining Vision model and RAG search"""
     
-    # 1. Image analysis
+    # 1. Load and analyze image once
     image = Image.open(image_path)
     if image.mode != 'RGB':
         image = image.convert('RGB')
@@ -727,25 +601,18 @@ def generate_rag_response(user_question, image_path, vision_model, processor, cl
     vision_predictions = predict_plant_disease(image, vision_model, processor, class_names_list)
     print(f"🔍 Vision Model Predictions: {vision_predictions}")
     
-    # 2. Query generation
-    parsed_query = generate_search_query(
-        text=user_question,
-        image_path=image_path, 
-        vision_model=vision_model,
-        processor=processor,
-        class_names_list=class_names_list
-    )
-    print(f"📝 Generated Queries: {parsed_query}")
+    # 2. Generate search queries using LLM
+    search_queries = generate_search_query(user_question, image, vision_predictions)
+    print(f"📝 Generated Queries: {search_queries['query']}")
     
     # 3. RAG search
-    search_results = search(parsed_query, k=3)
+    search_results = search(search_queries, k=3)
     
-    # 4. Context creation
+    # 4. Create context
     context_text = "\n".join([f"- {result['text']}" for result in search_results])
     
-    # 5. Response generation prompt
-    response_prompt = f"""
-# Plant Disease Diagnosis System
+    # 5. Generate final response
+    response_prompt = f"""# Plant Disease Diagnosis System
 
 ## Image Analysis Results
 {vision_predictions}
@@ -757,10 +624,8 @@ def generate_rag_response(user_question, image_path, vision_model, processor, cl
 {user_question}
 
 Based on the above image analysis results and expert knowledge, please provide a detailed and accurate response to the user's question.
-Include disease symptoms, management methods, prevention strategies, etc.
-"""
+Include disease symptoms, management methods, prevention strategies, etc."""
     
-    # 6. Final response generation
     messages = [
         {
             "role": "user",
@@ -784,24 +649,126 @@ Include disease symptoms, management methods, prevention strategies, etc.
         "final_response": final_response
     }
 
-# Test integrated system
-user_question = "What is this plant disease? Please tell me the symptoms and countermeasures."
-test_image_path = "/notebooks/plant_images/apple_apple_scab/image_0.jpg"
+# ========================================
+# Enhanced Testing with PIL Image Display and Captions
+# ========================================
 
-print("🌱 Plant Disease Diagnosis System - RAG Enhanced")
-print("=" * 60)
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from PIL import ImageDraw, ImageFont
+import textwrap
 
-result = generate_rag_response(
-    user_question=user_question,
-    image_path=test_image_path,
-    vision_model=vis_model,
-    processor=processor,
-    class_names_list=class_names
-)
+def add_caption_to_image(img, class_name, response_text, confidence=None):
+    """Add class name and response caption to image with 640x360 output size"""
+    # Resize image to standard 640x360 size
+    target_size = (640, 360)
+    img_resized = img.resize(target_size, Image.Resampling.LANCZOS)
+    draw = ImageDraw.Draw(img_resized)
+    
+    # Try to use default font, fallback to basic if not available
+    try:
+        font_title = ImageFont.truetype("arial.ttf", 16)
+        font_text = ImageFont.truetype("arial.ttf", 12)
+    except:
+        font_title = ImageFont.load_default()
+        font_text = ImageFont.load_default()
+    
+    # Format class name (avoid Unicode characters that may cause encoding issues)
+    display_class = class_name.replace('___', ' - ').replace('_', ' ')
+    if confidence:
+        title = f"{display_class} ({confidence:.1%})"
+    else:
+        title = display_class
+    
+    # Truncate response to 150 characters and clean Unicode
+    caption_text = response_text[:150] + "..." if len(response_text) > 150 else response_text
+    # Replace problematic Unicode characters with ASCII equivalents
+    caption_text = caption_text.replace('→', '->').replace('•', '*').replace('"', '"').replace('"', '"').replace(''', "'").replace(''', "'")
+    
+    # Wrap text to fit 640px width
+    max_width = 80  # Approximate characters per line for 640px width
+    wrapped_text = textwrap.fill(caption_text, width=max_width)
+    
+    # Calculate text dimensions
+    title_bbox = draw.textbbox((0, 0), title, font=font_title)
+    text_lines = wrapped_text.split('\n')
+    
+    # Calculate total caption height
+    title_height = title_bbox[3] - title_bbox[1]
+    text_height = len(text_lines) * 15 + 10  # Approximate line height
+    total_caption_height = title_height + text_height + 20  # padding
+    
+    # Create new image with space for caption (640px width, 360px + caption height)
+    new_height = target_size[1] + total_caption_height
+    captioned_img = Image.new('RGB', (target_size[0], new_height), color='white')
+    
+    # Paste resized image
+    captioned_img.paste(img_resized, (0, 0))
+    
+    # Draw on the new image
+    draw = ImageDraw.Draw(captioned_img)
+    
+    # Draw title (class name)
+    y_pos = target_size[1] + 10  # Start below the 360px image
+    draw.text((10, y_pos), title, fill=(0, 0, 0), font=font_title)  # Black color as RGB tuple
+    
+    # Draw wrapped caption text
+    y_pos += title_height + 10
+    for line in text_lines:
+        draw.text((10, y_pos), line, fill=(64, 64, 64), font=font_text)  # Dark gray as RGB tuple
+        y_pos += 15
+    
+    return captioned_img
 
-print("\n📊 Final Results:")
-print(f"Vision Predictions: {result['vision_predictions']}")
-print(f"\nRetrieved Knowledge: {len(result['search_results'])} relevant documents")
-print(f"\nFinal Response:\n{result['final_response']}")
+# Test scenarios - plant disease focused with different diseases
+test_cases = [
+    ("What is this plant disease? Please tell me the symptoms and countermeasures.", "Apple___Apple_scab"),
+    ("What are the main symptoms of this disease?", "Potato___Early_blight"), 
+    ("How can I prevent and treat this plant disease?", "Corn_(maize)___Northern_Leaf_Blight")
+]
+
+print("🌱 Plant Disease Diagnosis System - Enhanced Testing with Image Captions")
+print("=" * 80)
+
+for i, (question, fallback_class) in enumerate(test_cases, 1):
+    print(f"\n📋 Test {i}: {question}")
+    
+    # Use dataset image as fallback
+    test_images = [item for item in train_ds if class_names[item['labels']] == fallback_class]
+    test_image_path = test_images[0]['image'] if test_images else train_ds[0]['image']
+    
+    # Load image
+    img = Image.open(test_image_path)
+    print(f"📸 Image: {test_image_path.split('/')[-1]} ({img.size[0]}x{img.size[1]})")
+    
+    # Run diagnosis first to get results
+    result = generate_rag_response(question, test_image_path, vis_model, processor, class_names)
+    
+    # Get prediction info
+    top_prediction = result['vision_predictions'][0]
+    predicted_class = top_prediction['class_name']
+    confidence = top_prediction['confidence']
+    response_text = result['final_response']
+    
+    # Create image with caption
+    captioned_image = add_caption_to_image(img, predicted_class, response_text, confidence)
+    
+    # Display the captioned image
+    display(captioned_image)
+    
+    # Show comprehensive results
+    print(f"\n🎯 AI Diagnosis: {predicted_class.replace('___', ' - ').replace('_', ' ')} ({confidence:.1%})")
+    print(f"✅ Expected Class: {fallback_class.replace('___', ' - ').replace('_', ' ')}")
+    
+    if predicted_class == fallback_class:
+        print("✅ Diagnosis matches expected class")
+    else:
+        print("⚠️ Diagnosis differs from expected class")
+    
+    # Display complete expert response
+    print(f"\n💬 Complete Expert Response:")
+    print("=" * 80)
+    print(response_text)
+    print("=" * 80)
 
 # %%
